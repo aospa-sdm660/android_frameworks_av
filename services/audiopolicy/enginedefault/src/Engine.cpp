@@ -187,6 +187,14 @@ void Engine::filterOutputDevicesForStrategy(legacy_strategy strategy,
                  (primaryOutput->getPolicyAudioPort()->getModuleVersionMajor() < 3))) {
                 availableOutputDevices = availPrimaryOutputDevices;
             }
+
+        }
+        // Do not use A2DP devices when in call but use them when not in call
+        // (e.g for voice mail playback)
+        if (isInCall()) {
+            availableOutputDevices.remove(availableOutputDevices.getDevicesFromTypes({
+                    AUDIO_DEVICE_OUT_BLUETOOTH_A2DP, AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES,
+                    AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER, }));
         }
         } break;
     case STRATEGY_ACCESSIBILITY: {
@@ -266,12 +274,8 @@ DeviceVector Engine::getDevicesForStrategyInt(legacy_strategy strategy,
             devices = availableOutputDevices.getDevicesFromType(AUDIO_DEVICE_OUT_AUX_DIGITAL);
             if (!devices.isEmpty()) break;
         }
-        devices = availableOutputDevices.getFirstDevicesFromTypes({
-                                                                  AUDIO_DEVICE_OUT_WIRED_HEADPHONE,
-                                                                  AUDIO_DEVICE_OUT_WIRED_HEADSET,
-                                                                  AUDIO_DEVICE_OUT_LINE,
-                                                                  AUDIO_DEVICE_OUT_USB_HEADSET,
-                                                                  AUDIO_DEVICE_OUT_USB_DEVICE});
+        devices = availableOutputDevices.getFirstDevicesFromTypes(
+                                          getLastRemovableMediaDevices());
         if (!devices.isEmpty()) break;
         devices = availableOutputDevices.getDevicesFromType(AUDIO_DEVICE_OUT_EARPIECE);
     } break;

@@ -229,7 +229,8 @@ binder::Status SessionConfigurationUtils::createSurfaceFromGbp(
         OutputStreamInfo& streamInfo, bool isStreamInfoValid,
         sp<Surface>& surface, const sp<IGraphicBufferProducer>& gbp,
         const String8 &logicalCameraId, const CameraMetadata &physicalCameraMetadata,
-        const std::vector<int32_t> &sensorPixelModesUsed){
+        const std::vector<int32_t> &sensorPixelModesUsed,
+        bool isPriviledgedClient){
     // bufferProducer must be non-null
     if (gbp == nullptr) {
         String8 msg = String8::format("Camera %s: Surface is NULL", logicalCameraId.string());
@@ -259,7 +260,7 @@ binder::Status SessionConfigurationUtils::createSurfaceFromGbp(
     uint64_t allowedFlags = GraphicBuffer::USAGE_SW_READ_MASK |
                            GraphicBuffer::USAGE_HW_TEXTURE |
                            GraphicBuffer::USAGE_HW_COMPOSER;
-    bool flexibleConsumer = (consumerUsage & disallowedFlags) == 0 &&
+    bool flexibleConsumer = !isPriviledgedClient && (consumerUsage & disallowedFlags) == 0 &&
             (consumerUsage & allowedFlags) != 0;
 
     surface = new Surface(gbp, useAsync);
@@ -316,6 +317,7 @@ binder::Status SessionConfigurationUtils::createSurfaceFromGbp(
         // we can use the default stream configuration map
         foundInMaxRes = true;
     }
+
     // Round dimensions to the nearest dimensions available for this format
     if (flexibleConsumer && isPublicFormat(format) &&
             !SessionConfigurationUtils::roundBufferDimensionNearest(width, height,
@@ -669,15 +671,22 @@ status_t SessionConfigurationUtils::checkAndOverrideSensorPixelModesUsed(
         const std::vector<int32_t> &sensorPixelModesUsed, int format, int width, int height,
         const CameraMetadata &staticInfo, bool flexibleConsumer,
         std::unordered_set<int32_t> *overriddenSensorPixelModesUsed) {
+
+    const std::unordered_set<int32_t> &sensorPixelModesUsedSet =
+            convertToSet(sensorPixelModesUsed);
     if (!isUltraHighResolutionSensor(staticInfo)) {
+        if (sensorPixelModesUsedSet.find(ANDROID_SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION) !=
+                sensorPixelModesUsedSet.end()) {
+            // invalid value for non ultra high res sensors
+            return BAD_VALUE;
+        }
         overriddenSensorPixelModesUsed->clear();
         overriddenSensorPixelModesUsed->insert(ANDROID_SENSOR_PIXEL_MODE_DEFAULT);
         return OK;
     }
 
     StreamConfigurationPair streamConfigurationPair = getStreamConfigurationPair(staticInfo);
-    const std::unordered_set<int32_t> &sensorPixelModesUsedSet =
-            convertToSet(sensorPixelModesUsed);
+
     bool isInDefaultStreamConfigurationMap =
             inStreamConfigurationMap(format, width, height,
                     streamConfigurationPair.mDefaultStreamConfigurationMap);

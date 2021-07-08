@@ -523,7 +523,7 @@ void RevertOutputFormatIfNeeded(
 }
 
 void AmendOutputFormatWithCodecSpecificData(
-        const uint8_t *data, size_t size, const std::string mediaType,
+        const uint8_t *data, size_t size, const std::string &mediaType,
         const sp<AMessage> &outputFormat) {
     if (mediaType == MIMETYPE_VIDEO_AVC) {
         // Codec specific data should be SPS and PPS in a single buffer,
@@ -1500,13 +1500,11 @@ void CCodec::createInputSurface() {
     status_t err;
     sp<IGraphicBufferProducer> bufferProducer;
 
-    sp<AMessage> inputFormat;
     sp<AMessage> outputFormat;
     uint64_t usage = 0;
     {
         Mutexed<std::unique_ptr<Config>>::Locked configLocked(mConfig);
         const std::unique_ptr<Config> &config = *configLocked;
-        inputFormat = config->mInputFormat;
         outputFormat = config->mOutputFormat;
         usage = config->mISConfig ? config->mISConfig->mUsage : 0;
     }
@@ -1542,6 +1540,14 @@ void CCodec::createInputSurface() {
         return;
     }
 
+    // Formats can change after setupInputSurface
+    sp<AMessage> inputFormat;
+    {
+        Mutexed<std::unique_ptr<Config>>::Locked configLocked(mConfig);
+        const std::unique_ptr<Config> &config = *configLocked;
+        inputFormat = config->mInputFormat;
+        outputFormat = config->mOutputFormat;
+    }
     mCallback->onInputSurfaceCreated(
             inputFormat,
             outputFormat,
@@ -1591,13 +1597,11 @@ void CCodec::initiateSetInputSurface(const sp<PersistentSurface> &surface) {
 }
 
 void CCodec::setInputSurface(const sp<PersistentSurface> &surface) {
-    sp<AMessage> inputFormat;
     sp<AMessage> outputFormat;
     uint64_t usage = 0;
     {
         Mutexed<std::unique_ptr<Config>>::Locked configLocked(mConfig);
         const std::unique_ptr<Config> &config = *configLocked;
-        inputFormat = config->mInputFormat;
         outputFormat = config->mOutputFormat;
         usage = config->mISConfig ? config->mISConfig->mUsage : 0;
     }
@@ -1628,6 +1632,14 @@ void CCodec::setInputSurface(const sp<PersistentSurface> &surface) {
         ALOGE("Failed to set input surface: Corrupted surface.");
         mCallback->onInputSurfaceDeclined(UNKNOWN_ERROR);
         return;
+    }
+    // Formats can change after setupInputSurface
+    sp<AMessage> inputFormat;
+    {
+        Mutexed<std::unique_ptr<Config>>::Locked configLocked(mConfig);
+        const std::unique_ptr<Config> &config = *configLocked;
+        inputFormat = config->mInputFormat;
+        outputFormat = config->mOutputFormat;
     }
     mCallback->onInputSurfaceAccepted(inputFormat, outputFormat);
 }
@@ -2446,6 +2458,11 @@ void CCodec::initiateReleaseIfStuck() {
     C2String compName;
     {
         Mutexed<State>::Locked state(mState);
+        if (!state->comp) {
+            ALOGD("previous call to %s exceeded timeout "
+                  "and the component is already released", name.c_str());
+            return;
+        }
         compName = state->comp->getName();
     }
     ALOGW("[%s] previous call to %s exceeded timeout", compName.c_str(), name.c_str());
@@ -2671,7 +2688,11 @@ static status_t CalculateMinMaxUsage(
             *maxUsage = 0;
             continue;
         }
-        *minUsage |= supported.values[0].u64;
+        if (supported.values.size() > 1) {
+            *minUsage |= supported.values[1].u64;
+        } else {
+            *minUsage |= supported.values[0].u64;
+        }
         int64_t currentMaxUsage = 0;
         for (const C2Value::Primitive &flags : supported.values) {
             currentMaxUsage |= flags.u64;

@@ -71,25 +71,30 @@ std::string AAudioServiceEndpointMMAP::dump() const {
 aaudio_result_t AAudioServiceEndpointMMAP::open(const aaudio::AAudioStreamRequest &request) {
     aaudio_result_t result = AAUDIO_OK;
     copyFrom(request.getConstantConfiguration());
-    mMmapClient.identity = request.getIdentity();
-    // TODO b/182392769: use identity util
-    mMmapClient.identity.uid = VALUE_OR_FATAL(
+    mMmapClient.attributionSource = request.getAttributionSource();
+    // TODO b/182392769: use attribution source util
+    mMmapClient.attributionSource.uid = VALUE_OR_FATAL(
         legacy2aidl_uid_t_int32_t(IPCThreadState::self()->getCallingUid()));
-    mMmapClient.identity.pid = VALUE_OR_FATAL(
+    mMmapClient.attributionSource.pid = VALUE_OR_FATAL(
         legacy2aidl_pid_t_int32_t(IPCThreadState::self()->getCallingPid()));
 
     audio_format_t audioFormat = getFormat();
 
-    // FLOAT is not directly supported by the HAL so ask for a 24-bit.
-    bool isHighResRequested = audioFormat == AUDIO_FORMAT_PCM_FLOAT
-            || audioFormat == AUDIO_FORMAT_PCM_32_BIT;
-    if (isHighResRequested) {
+    // FLOAT is not directly supported by the HAL so ask for a 32-bit.
+    if (audioFormat == AUDIO_FORMAT_PCM_FLOAT) {
         // TODO remove these logs when finished debugging.
-        ALOGD("%s() change format from %d to 24_BIT_PACKED", __func__, audioFormat);
-        audioFormat = AUDIO_FORMAT_PCM_24_BIT_PACKED;
+        ALOGD("%s() change format from %d to 32_BIT", __func__, audioFormat);
+        audioFormat = AUDIO_FORMAT_PCM_32_BIT;
     }
 
     result = openWithFormat(audioFormat);
+    if (result == AAUDIO_OK) return result;
+
+    if (result == AAUDIO_ERROR_UNAVAILABLE && audioFormat == AUDIO_FORMAT_PCM_32_BIT) {
+        ALOGD("%s() 32_BIT failed, perhaps due to format. Try again with 24_BIT_PACKED", __func__);
+        audioFormat = AUDIO_FORMAT_PCM_24_BIT_PACKED;
+        result = openWithFormat(audioFormat);
+    }
     if (result == AAUDIO_OK) return result;
 
     // TODO The HAL and AudioFlinger should be recommending a format if the open fails.
@@ -160,8 +165,8 @@ aaudio_result_t AAudioServiceEndpointMMAP::openWithFormat(audio_format_t audioFo
                                                           this, // callback
                                                           mMmapStream,
                                                           &mPortHandle);
-    ALOGD("%s() mMapClient.identity = %s => portHandle = %d\n",
-          __func__, mMmapClient.identity.toString().c_str(), mPortHandle);
+    ALOGD("%s() mMapClient.attributionSource = %s => portHandle = %d\n",
+          __func__, mMmapClient.attributionSource.toString().c_str(), mPortHandle);
     if (status != OK) {
         // This can happen if the resource is busy or the config does
         // not match the hardware.
@@ -211,7 +216,7 @@ aaudio_result_t AAudioServiceEndpointMMAP::openWithFormat(audio_format_t audioFo
         // Exclusive mode can only be used by the service because the FD cannot be shared.
         int32_t audioServiceUid =
             VALUE_OR_FATAL(legacy2aidl_uid_t_int32_t(getuid()));
-        if ((mMmapClient.identity.uid != audioServiceUid) &&
+        if ((mMmapClient.attributionSource.uid != audioServiceUid) &&
             getSharingMode() == AAUDIO_SHARING_MODE_EXCLUSIVE) {
             ALOGW("%s() - exclusive FD cannot be used by client", __func__);
             result = AAUDIO_ERROR_UNAVAILABLE;

@@ -118,7 +118,7 @@ static inline T min(const T& a, const T& b)
 namespace android {
 
 using media::IEffectClient;
-using media::permission::Identity;
+using content::AttributionSourceState;
 
 // retry counts for buffer fill timeout
 // 50 * ~20msecs = 1 second
@@ -818,7 +818,7 @@ String8 channelMaskToString(audio_channel_mask_t mask, bool output) {
             if (mask & AUDIO_CHANNEL_OUT_FRONT_LEFT) s.append("front-left, ");
             if (mask & AUDIO_CHANNEL_OUT_FRONT_RIGHT) s.append("front-right, ");
             if (mask & AUDIO_CHANNEL_OUT_FRONT_CENTER) s.append("front-center, ");
-            if (mask & AUDIO_CHANNEL_OUT_LOW_FREQUENCY) s.append("low freq, ");
+            if (mask & AUDIO_CHANNEL_OUT_LOW_FREQUENCY) s.append("low-frequency, ");
             if (mask & AUDIO_CHANNEL_OUT_BACK_LEFT) s.append("back-left, ");
             if (mask & AUDIO_CHANNEL_OUT_BACK_RIGHT) s.append("back-right, ");
             if (mask & AUDIO_CHANNEL_OUT_FRONT_LEFT_OF_CENTER) s.append("front-left-of-center, ");
@@ -838,7 +838,7 @@ String8 channelMaskToString(audio_channel_mask_t mask, bool output) {
             if (mask & AUDIO_CHANNEL_OUT_BOTTOM_FRONT_LEFT) s.append("bottom-front-left, ");
             if (mask & AUDIO_CHANNEL_OUT_BOTTOM_FRONT_CENTER) s.append("bottom-front-center, ");
             if (mask & AUDIO_CHANNEL_OUT_BOTTOM_FRONT_RIGHT) s.append("bottom-front-right, ");
-            if (mask & AUDIO_CHANNEL_OUT_LOW_FREQUENCY_2) s.append("low_frequency_2, ");
+            if (mask & AUDIO_CHANNEL_OUT_LOW_FREQUENCY_2) s.append("low-frequency-2, ");
             if (mask & AUDIO_CHANNEL_OUT_HAPTIC_B) s.append("haptic-B, ");
             if (mask & AUDIO_CHANNEL_OUT_HAPTIC_A) s.append("haptic-A, ");
             if (mask & ~AUDIO_CHANNEL_OUT_ALL) s.append("unknown,  ");
@@ -858,7 +858,7 @@ String8 channelMaskToString(audio_channel_mask_t mask, bool output) {
             if (mask & AUDIO_CHANNEL_IN_BACK_LEFT) s.append("back-left, ");
             if (mask & AUDIO_CHANNEL_IN_BACK_RIGHT) s.append("back-right, ");
             if (mask & AUDIO_CHANNEL_IN_CENTER) s.append("center, ");
-            if (mask & AUDIO_CHANNEL_IN_LOW_FREQUENCY) s.append("low freq, ");
+            if (mask & AUDIO_CHANNEL_IN_LOW_FREQUENCY) s.append("low-frequency, ");
             if (mask & AUDIO_CHANNEL_IN_TOP_LEFT) s.append("top-left, ");
             if (mask & AUDIO_CHANNEL_IN_TOP_RIGHT) s.append("top-right, ");
             if (mask & AUDIO_CHANNEL_IN_VOICE_UPLINK) s.append("voice-uplink, ");
@@ -1804,8 +1804,14 @@ void AudioFlinger::ThreadBase::ActiveTracks<T>::updatePowerState(
 
 template <typename T>
 bool AudioFlinger::ThreadBase::ActiveTracks<T>::readAndClearHasChanged() {
-    const bool hasChanged = mHasChanged;
+    bool hasChanged = mHasChanged;
     mHasChanged = false;
+
+    for (const sp<T> &track : mActiveTracks) {
+        // Do not short-circuit as all hasChanged states must be reset
+        // as all the metadata are going to be sent
+        hasChanged |= track->readAndClearHasChanged();
+    }
     return hasChanged;
 }
 
@@ -1992,7 +1998,7 @@ AudioFlinger::PlaybackThread::~PlaybackThread()
 
 void AudioFlinger::PlaybackThread::onFirstRef()
 {
-    if (mOutput == nullptr || mOutput->stream == nullptr) {
+    if (!isStreamInitialized()) {
         ALOGE("The stream is not open yet"); // This should not happen.
     } else {
         // setEventCallback will need a strong pointer as a parameter. Calling it
@@ -2129,7 +2135,7 @@ sp<AudioFlinger::PlaybackThread::Track> AudioFlinger::PlaybackThread::createTrac
         audio_session_t sessionId,
         audio_output_flags_t *flags,
         pid_t creatorPid,
-        const Identity& identity,
+        const AttributionSourceState& attributionSource,
         pid_t tid,
         status_t *status,
         audio_port_handle_t portId,
@@ -2424,8 +2430,8 @@ sp<AudioFlinger::PlaybackThread::Track> AudioFlinger::PlaybackThread::createTrac
         track = new Track(this, client, streamType, attr, sampleRate, format,
                           channelMask, frameCount,
                           nullptr /* buffer */, (size_t)0 /* bufferSize */, sharedBuffer,
-                          sessionId, creatorPid, identity, trackFlags, TrackBase::TYPE_DEFAULT,
-                          portId, SIZE_MAX /*frameCountToBeReady*/);
+                          sessionId, creatorPid, attributionSource, trackFlags,
+                          TrackBase::TYPE_DEFAULT, portId, SIZE_MAX /*frameCountToBeReady*/, speed);
 
         lStatus = track != 0 ? track->initCheck() : (status_t) NO_MEMORY;
         if (lStatus != NO_ERROR) {
@@ -2701,7 +2707,7 @@ String8 AudioFlinger::PlaybackThread::getParameters(const String8& keys)
 
 status_t AudioFlinger::DirectOutputThread::selectPresentation(int presentationId, int programId) {
     Mutex::Autolock _l(mLock);
-    if (mOutput == nullptr || mOutput->stream == nullptr) {
+    if (!isStreamInitialized()) {
         return NO_INIT;
     }
     return mOutput->stream->selectPresentation(presentationId, programId);
@@ -3012,16 +3018,7 @@ void AudioFlinger::PlaybackThread::readOutputParameters_l()
 
 void AudioFlinger::PlaybackThread::updateMetadata_l()
 {
-    if (mOutput == nullptr || mOutput->stream == nullptr ) {
-        return; // That should not happen
-    }
-    bool hasChanged = mActiveTracks.readAndClearHasChanged();
-    for (const sp<Track> &track : mActiveTracks) {
-        // Do not short-circuit as all hasChanged states must be reset
-        // as all the metadata are going to be sent
-        hasChanged |= track->readAndClearHasChanged();
-    }
-    if (!hasChanged) {
+    if (!isStreamInitialized() || !mActiveTracks.readAndClearHasChanged()) {
         return; // nothing to do
     }
     StreamOutHalInterface::SourceMetadata metadata;
@@ -3342,6 +3339,17 @@ void AudioFlinger::PlaybackThread::invalidateTracks(audio_stream_type_t streamTy
 {
     Mutex::Autolock _l(mLock);
     invalidateTracks_l(streamType);
+}
+
+// getTrackById_l must be called with holding thread lock
+AudioFlinger::PlaybackThread::Track* AudioFlinger::PlaybackThread::getTrackById_l(
+        audio_port_handle_t trackPortId) {
+    for (size_t i = 0; i < mTracks.size(); i++) {
+        if (mTracks[i]->portId() == trackPortId) {
+            return mTracks[i].get();
+        }
+    }
+    return nullptr;
 }
 
 status_t AudioFlinger::PlaybackThread::addEffectChain_l(const sp<EffectChain>& chain)
@@ -6995,19 +7003,20 @@ void AudioFlinger::DuplicatingThread::addOutputTrack(MixerThread *thread)
     // from different OutputTracks and their associated MixerThreads (e.g. one may
     // nearly empty and the other may be dropping data).
 
-    // TODO b/182392769: use identity util, move to server edge
-    Identity identity = Identity();
-    identity.uid = VALUE_OR_FATAL(legacy2aidl_uid_t_int32_t(
+    // TODO b/182392769: use attribution source util, move to server edge
+    AttributionSourceState attributionSource = AttributionSourceState();
+    attributionSource.uid = VALUE_OR_FATAL(legacy2aidl_uid_t_int32_t(
         IPCThreadState::self()->getCallingUid()));
-    identity.pid = VALUE_OR_FATAL(legacy2aidl_pid_t_int32_t(
+    attributionSource.pid = VALUE_OR_FATAL(legacy2aidl_pid_t_int32_t(
       IPCThreadState::self()->getCallingPid()));
+    attributionSource.token = sp<BBinder>::make();
     sp<OutputTrack> outputTrack = new OutputTrack(thread,
                                             this,
                                             mSampleRate,
                                             mFormat,
                                             mChannelMask,
                                             frameCount,
-                                            identity);
+                                            attributionSource);
     status_t status = outputTrack != 0 ? outputTrack->initCheck() : (status_t) NO_MEMORY;
     if (status != NO_ERROR) {
         ALOGE("addOutputTrack() initCheck failed %d", status);
@@ -7422,18 +7431,28 @@ reacquire_wakelock:
                     //    the only active track
                     // 2) invalidate this track: this will cause the client to reconnect and possibly
                     //    be invalidated again until unsilenced
+                    bool invalidate = false;
                     if (activeTrack->isSilenced()) {
                         if (size > 1) {
-                            activeTrack->invalidate();
-                            ALOG_ASSERT(fastTrackToRemove == 0);
-                            fastTrackToRemove = activeTrack;
-                            removeTrack_l(activeTrack);
-                            mActiveTracks.remove(activeTrack);
-                            size--;
-                            continue;
+                            invalidate = true;
                         } else {
                             silenceFastCapture = true;
                         }
+                    }
+                    // Invalidate fast tracks if access to audio history is required as this is not
+                    // possible with fast tracks. Once the fast track has been invalidated, no new
+                    // fast track will be created until mMaxSharedAudioHistoryMs is cleared.
+                    if (mMaxSharedAudioHistoryMs != 0) {
+                        invalidate = true;
+                    }
+                    if (invalidate) {
+                        activeTrack->invalidate();
+                        ALOG_ASSERT(fastTrackToRemove == 0);
+                        fastTrackToRemove = activeTrack;
+                        removeTrack_l(activeTrack);
+                        mActiveTracks.remove(activeTrack);
+                        size--;
+                        continue;
                     }
                     fastTrack = activeTrack;
                 }
@@ -7921,7 +7940,7 @@ sp<AudioFlinger::RecordThread::RecordTrack> AudioFlinger::RecordThread::createRe
         audio_session_t sessionId,
         size_t *pNotificationFrameCount,
         pid_t creatorPid,
-        const Identity& identity,
+        const AttributionSourceState& attributionSource,
         audio_input_flags_t *flags,
         pid_t tid,
         status_t *status,
@@ -7935,7 +7954,8 @@ sp<AudioFlinger::RecordThread::RecordTrack> AudioFlinger::RecordThread::createRe
     audio_input_flags_t inputFlags = mInput->flags;
     audio_input_flags_t requestedFlags = *flags;
     uint32_t sampleRate;
-    Identity checkedIdentity = AudioFlinger::checkIdentityPackage(identity);
+    AttributionSourceState checkedAttributionSource = AudioFlinger::checkAttributionSourcePackage(
+            attributionSource);
 
     lStatus = initCheck();
     if (lStatus != NO_ERROR) {
@@ -7950,14 +7970,8 @@ sp<AudioFlinger::RecordThread::RecordTrack> AudioFlinger::RecordThread::createRe
     }
 
     if (maxSharedAudioHistoryMs != 0) {
-        if (!captureHotwordAllowed(checkedIdentity)) {
+        if (!captureHotwordAllowed(checkedAttributionSource)) {
             lStatus = PERMISSION_DENIED;
-            goto Exit;
-        }
-        //TODO: b/185972521 allow resampling buffer resizing on fast mixers by pausing
-        // the fast mixer thread while resizing the buffer in the normal thread
-        if (hasFastCapture()) {
-            lStatus = BAD_VALUE;
             goto Exit;
         }
         if (maxSharedAudioHistoryMs < 0
@@ -7971,8 +7985,9 @@ sp<AudioFlinger::RecordThread::RecordTrack> AudioFlinger::RecordThread::createRe
     }
     sampleRate = *pSampleRate;
 
-    // special case for FAST flag considered OK if fast capture is present
-    if (hasFastCapture()) {
+    // special case for FAST flag considered OK if fast capture is present and access to
+    // audio history is not required
+    if (hasFastCapture() && mMaxSharedAudioHistoryMs == 0) {
         inputFlags = (audio_input_flags_t)(inputFlags | AUDIO_INPUT_FLAG_FAST);
     }
 
@@ -7984,8 +7999,9 @@ sp<AudioFlinger::RecordThread::RecordTrack> AudioFlinger::RecordThread::createRe
         *flags = (audio_input_flags_t)(*flags & inputFlags);
     }
 
-    // client expresses a preference for FAST, but we get the final say
-    if (*flags & AUDIO_INPUT_FLAG_FAST) {
+    // client expresses a preference for FAST and no access to audio history,
+    // but we get the final say
+    if (*flags & AUDIO_INPUT_FLAG_FAST && maxSharedAudioHistoryMs == 0) {
       if (
             // we formerly checked for a callback handler (non-0 tid),
             // but that is no longer required for TRANSFER_OBTAIN mode
@@ -8076,16 +8092,17 @@ sp<AudioFlinger::RecordThread::RecordTrack> AudioFlinger::RecordThread::createRe
         Mutex::Autolock _l(mLock);
         int32_t startFrames = -1;
         if (!mSharedAudioPackageName.empty()
-                && mSharedAudioPackageName == checkedIdentity.packageName
+                && mSharedAudioPackageName == checkedAttributionSource.packageName
                 && mSharedAudioSessionId == sessionId
-                && captureHotwordAllowed(checkedIdentity)) {
+                && captureHotwordAllowed(checkedAttributionSource)) {
             startFrames = mSharedAudioStartFrames;
         }
 
         track = new RecordTrack(this, client, attr, sampleRate,
                       format, channelMask, frameCount,
                       nullptr /* buffer */, (size_t)0 /* bufferSize */, sessionId, creatorPid,
-                      checkedIdentity, *flags, TrackBase::TYPE_DEFAULT, portId, startFrames);
+                      checkedAttributionSource, *flags, TrackBase::TYPE_DEFAULT, portId,
+                      startFrames);
 
         lStatus = track->initCheck();
         if (lStatus != NO_ERROR) {
@@ -8105,7 +8122,6 @@ sp<AudioFlinger::RecordThread::RecordTrack> AudioFlinger::RecordThread::createRe
         if (maxSharedAudioHistoryMs != 0) {
             sendResizeBufferConfigEvent_l(maxSharedAudioHistoryMs);
         }
-
     }
 
     lStatus = NO_ERROR;
@@ -8298,7 +8314,7 @@ status_t AudioFlinger::RecordThread::getActiveMicrophones(
 {
     ALOGV("RecordThread::getActiveMicrophones");
     AutoMutex _l(mLock);
-    if (mInput == nullptr || mInput->stream == nullptr) {
+    if (!isStreamInitialized()) {
         return NO_INIT;
     }
     status_t status = mInput->stream->getActiveMicrophones(activeMicrophones);
@@ -8310,7 +8326,7 @@ status_t AudioFlinger::RecordThread::setPreferredMicrophoneDirection(
 {
     ALOGV("setPreferredMicrophoneDirection(%d)", direction);
     AutoMutex _l(mLock);
-    if (mInput == nullptr || mInput->stream == nullptr) {
+    if (!isStreamInitialized()) {
         return NO_INIT;
     }
     return mInput->stream->setPreferredMicrophoneDirection(direction);
@@ -8320,7 +8336,7 @@ status_t AudioFlinger::RecordThread::setPreferredMicrophoneFieldDimension(float 
 {
     ALOGV("setPreferredMicrophoneFieldDimension(%f)", zoom);
     AutoMutex _l(mLock);
-    if (mInput == nullptr || mInput->stream == nullptr) {
+    if (!isStreamInitialized()) {
         return NO_INIT;
     }
     return mInput->stream->setPreferredMicrophoneFieldDimension(zoom);
@@ -8336,9 +8352,6 @@ status_t AudioFlinger::RecordThread::shareAudioHistory(
 status_t AudioFlinger::RecordThread::shareAudioHistory_l(
         const std::string& sharedAudioPackageName, audio_session_t sharedSessionId,
         int64_t sharedAudioStartMs) {
-    if (hasFastCapture()) {
-        return BAD_VALUE;
-    }
     if ((hasAudioSession_l(sharedSessionId) & ThreadBase::TRACK_SESSION) == 0) {
         return BAD_VALUE;
     }
@@ -8374,9 +8387,8 @@ status_t AudioFlinger::RecordThread::shareAudioHistory_l(
 
 void AudioFlinger::RecordThread::updateMetadata_l()
 {
-    if (mInput == nullptr || mInput->stream == nullptr ||
-            !mActiveTracks.readAndClearHasChanged()) {
-        return;
+    if (!isStreamInitialized() || !mActiveTracks.readAndClearHasChanged()) {
+        return; // nothing to do
     }
     StreamInHalInterface::SinkMetadata metadata;
     for (const sp<RecordTrack> &track : mActiveTracks) {
@@ -8581,6 +8593,7 @@ status_t AudioFlinger::RecordThread::ResamplerBufferProvider::getNextBuffer(
     // FIXME if client not keeping up, discard
     LOG_ALWAYS_FATAL_IF(!(0 <= filled && (size_t) filled <= recordThread->mRsmpInFrames));
     // 'filled' may be non-contiguous, so return only the first contiguous chunk
+
     front &= recordThread->mRsmpInFramesP2 - 1;
     size_t part1 = recordThread->mRsmpInFramesP2 - front;
     if (part1 > (size_t) filled) {
@@ -8795,7 +8808,7 @@ void AudioFlinger::RecordThread::readInputParameters_l()
 
     // mRsmpInFrames must be 0 before calling resizeInputBuffer_l for the first time
     mRsmpInFrames = 0;
-    resizeInputBuffer_l();
+    resizeInputBuffer_l(0 /*maxSharedAudioHistoryMs*/);
 
     // AudioRecord mSampleRate and mChannelCount are constant due to AudioRecord API constraints.
     // But if thread's mSampleRate or mChannelCount changes, how will that affect active tracks?
@@ -9036,6 +9049,10 @@ void AudioFlinger::RecordThread::resizeInputBuffer_l(int32_t maxSharedAudioHisto
     int32_t previousRear = mRsmpInRear;
     mRsmpInRear = 0;
 
+    ALOG_ASSERT(maxSharedAudioHistoryMs >= 0
+            && maxSharedAudioHistoryMs <= AudioFlinger::kMaxSharedAudioHistoryMs,
+            "resizeInputBuffer_l() called with invalid max shared history %d",
+            maxSharedAudioHistoryMs);
     if (maxSharedAudioHistoryMs != 0) {
         // resizeInputBuffer_l should never be called with a non zero shared history if the
         // buffer was not already allocated
@@ -9048,6 +9065,7 @@ void AudioFlinger::RecordThread::resizeInputBuffer_l(int32_t maxSharedAudioHisto
         }
         mRsmpInFrames = rsmpInFrames;
     }
+    mMaxSharedAudioHistoryMs = maxSharedAudioHistoryMs;
     // Note: mRsmpInFrames is 0 when called with maxSharedAudioHistoryMs equals to 0 so it is always
     // initialized
     if (mRsmpInFrames < minRsmpInFrames) {
@@ -9276,7 +9294,7 @@ status_t AudioFlinger::MmapThread::start(const AudioClient& client,
                                          audio_port_handle_t *handle)
 {
     ALOGV("%s clientUid %d mStandby %d mPortId %d *handle %d", __FUNCTION__,
-          client.identity.uid, mStandby, mPortId, *handle);
+          client.attributionSource.uid, mStandby, mPortId, *handle);
     if (mHalStream == 0) {
         return NO_INIT;
     }
@@ -9308,7 +9326,7 @@ status_t AudioFlinger::MmapThread::start(const AudioClient& client,
         ret = AudioSystem::getOutputForAttr(&mAttr, &io,
                                             mSessionId,
                                             &stream,
-                                            client.identity,
+                                            client.attributionSource,
                                             &config,
                                             flags,
                                             &deviceId,
@@ -9325,7 +9343,7 @@ status_t AudioFlinger::MmapThread::start(const AudioClient& client,
         ret = AudioSystem::getInputForAttr(&mAttr, &io,
                                               RECORD_RIID_INVALID,
                                               mSessionId,
-                                              client.identity,
+                                              client.attributionSource,
                                               &config,
                                               AUDIO_INPUT_FLAG_MMAP_NOIRQ,
                                               &deviceId,
@@ -9365,7 +9383,8 @@ status_t AudioFlinger::MmapThread::start(const AudioClient& client,
 
     // Given that MmapThread::mAttr is mutable, should a MmapTrack have attributes ?
     sp<MmapTrack> track = new MmapTrack(this, attr == nullptr ? mAttr : *attr, mSampleRate, mFormat,
-                                        mChannelMask, mSessionId, isOutput(), client.identity,
+                                        mChannelMask, mSessionId, isOutput(),
+                                        client.attributionSource,
                                         IPCThreadState::self()->getCallingPid(), portId);
 
     if (isOutput()) {
@@ -9373,7 +9392,7 @@ status_t AudioFlinger::MmapThread::start(const AudioClient& client,
         mHalVolFloat = -1.0f;
     } else if (!track->isSilenced_l()) {
         for (const sp<MmapTrack> &t : mActiveTracks) {
-            if (t->isSilenced_l() && t->uid() != client.identity.uid)
+            if (t->isSilenced_l() && t->uid() != client.attributionSource.uid)
                 t->invalidate();
         }
     }
@@ -10068,14 +10087,16 @@ void AudioFlinger::MmapPlaybackThread::processVolume_l()
                 }
             }
         }
+        for (const sp<MmapTrack> &track : mActiveTracks) {
+            track->setMetadataHasChanged();
+        }
     }
 }
 
 void AudioFlinger::MmapPlaybackThread::updateMetadata_l()
 {
-    if (mOutput == nullptr || mOutput->stream == nullptr ||
-            !mActiveTracks.readAndClearHasChanged()) {
-        return;
+    if (!isStreamInitialized() || !mActiveTracks.readAndClearHasChanged()) {
+        return; // nothing to do
     }
     StreamOutHalInterface::SourceMetadata metadata;
     for (const sp<MmapTrack> &track : mActiveTracks) {
@@ -10202,9 +10223,8 @@ void AudioFlinger::MmapCaptureThread::processVolume_l()
 
 void AudioFlinger::MmapCaptureThread::updateMetadata_l()
 {
-    if (mInput == nullptr || mInput->stream == nullptr ||
-            !mActiveTracks.readAndClearHasChanged()) {
-        return;
+    if (!isStreamInitialized() || !mActiveTracks.readAndClearHasChanged()) {
+        return; // nothing to do
     }
     StreamInHalInterface::SinkMetadata metadata;
     for (const sp<MmapTrack> &track : mActiveTracks) {
