@@ -75,7 +75,7 @@ using android::hardware::camera::metadata::V3_6::CameraMetadataEnumAndroidSensor
 
 namespace android {
 
-Camera3Device::Camera3Device(const String8 &id):
+Camera3Device::Camera3Device(const String8 &id, bool overrideForPerfClass):
         mId(id),
         mOperatingMode(NO_MODE),
         mIsConstrainedHighSpeedConfiguration(false),
@@ -93,7 +93,8 @@ Camera3Device::Camera3Device(const String8 &id):
         mListener(NULL),
         mVendorTagId(CAMERA_METADATA_INVALID_VENDOR_ID),
         mLastTemplateId(-1),
-        mNeedFixupMonochromeTags(false)
+        mNeedFixupMonochromeTags(false),
+        mOverrideForPerfClass(overrideForPerfClass)
 {
     ATRACE_CALL();
     ALOGV("%s: Created device for camera %s", __FUNCTION__, mId.string());
@@ -132,7 +133,7 @@ status_t Camera3Device::initialize(sp<CameraProviderManager> manager, const Stri
         return res;
     }
 
-    res = manager->getCameraCharacteristics(mId.string(), &mDeviceInfo);
+    res = manager->getCameraCharacteristics(mId.string(), mOverrideForPerfClass, &mDeviceInfo);
     if (res != OK) {
         SET_ERR_L("Could not retrieve camera characteristics: %s (%d)", strerror(-res), res);
         session->close();
@@ -144,8 +145,9 @@ status_t Camera3Device::initialize(sp<CameraProviderManager> manager, const Stri
     bool isLogical = manager->isLogicalCamera(mId.string(), &physicalCameraIds);
     if (isLogical) {
         for (auto& physicalId : physicalCameraIds) {
+            // Do not override characteristics for physical cameras
             res = manager->getCameraCharacteristics(
-                    physicalId, &mPhysicalDeviceInfoMap[physicalId]);
+                    physicalId, /*overrideForPerfClass*/false, &mPhysicalDeviceInfoMap[physicalId]);
             if (res != OK) {
                 SET_ERR_L("Could not retrieve camera %s characteristics: %s (%d)",
                         physicalId.c_str(), strerror(-res), res);
@@ -353,9 +355,15 @@ status_t Camera3Device::initializeCommonLocked() {
     camera_metadata_entry_t availableTestPatternModes = mDeviceInfo.find(
             ANDROID_SENSOR_AVAILABLE_TEST_PATTERN_MODES);
     for (size_t i = 0; i < availableTestPatternModes.count; i++) {
-        if (availableTestPatternModes.data.i32[i] == ANDROID_SENSOR_TEST_PATTERN_MODE_SOLID_COLOR) {
+        if (availableTestPatternModes.data.i32[i] ==
+                ANDROID_SENSOR_TEST_PATTERN_MODE_SOLID_COLOR) {
             mSupportCameraMute = true;
+            mSupportTestPatternSolidColor = true;
             break;
+        } else if (availableTestPatternModes.data.i32[i] ==
+                ANDROID_SENSOR_TEST_PATTERN_MODE_BLACK) {
+            mSupportCameraMute = true;
+            mSupportTestPatternSolidColor = false;
         }
     }
 
@@ -766,16 +774,21 @@ status_t Camera3Device::dump(int fd, const Vector<String16> &args) {
     }
 
     lines = String8("    In-flight requests:\n");
-    if (mInFlightMap.size() == 0) {
-        lines.append("      None\n");
-    } else {
-        for (size_t i = 0; i < mInFlightMap.size(); i++) {
-            InFlightRequest r = mInFlightMap.valueAt(i);
-            lines.appendFormat("      Frame %d |  Timestamp: %" PRId64 ", metadata"
-                    " arrived: %s, buffers left: %d\n", mInFlightMap.keyAt(i),
-                    r.shutterTimestamp, r.haveResultMetadata ? "true" : "false",
-                    r.numBuffersLeft);
+    if (mInFlightLock.try_lock()) {
+        if (mInFlightMap.size() == 0) {
+            lines.append("      None\n");
+        } else {
+            for (size_t i = 0; i < mInFlightMap.size(); i++) {
+                InFlightRequest r = mInFlightMap.valueAt(i);
+                lines.appendFormat("      Frame %d |  Timestamp: %" PRId64 ", metadata"
+                        " arrived: %s, buffers left: %d\n", mInFlightMap.keyAt(i),
+                        r.shutterTimestamp, r.haveResultMetadata ? "true" : "false",
+                        r.numBuffersLeft);
+            }
         }
+        mInFlightLock.unlock();
+    } else {
+        lines.append("      Failed to acquire In-flight lock!\n");
     }
     write(fd, lines.string(), lines.size());
 
@@ -4167,7 +4180,7 @@ Camera3Device::RequestThread::RequestThread(wp<Camera3Device> parent,
         mCurrentAfTriggerId(0),
         mCurrentPreCaptureTriggerId(0),
         mRotateAndCropOverride(ANDROID_SCALER_ROTATE_AND_CROP_NONE),
-        mCameraMute(false),
+        mCameraMute(ANDROID_SENSOR_TEST_PATTERN_MODE_OFF),
         mCameraMuteChanged(false),
         mRepeatingLastFrameNumber(
             hardware::camera2::ICameraDeviceUser::NO_IN_FLIGHT_REPEATING_FRAMES),
@@ -5275,11 +5288,11 @@ status_t Camera3Device::RequestThread::setRotateAndCropAutoBehavior(
     return OK;
 }
 
-status_t Camera3Device::RequestThread::setCameraMute(bool enabled) {
+status_t Camera3Device::RequestThread::setCameraMute(int32_t muteMode) {
     ATRACE_CALL();
     Mutex::Autolock l(mTriggerMutex);
-    if (enabled != mCameraMute) {
-        mCameraMute = enabled;
+    if (muteMode != mCameraMute) {
+        mCameraMute = muteMode;
         mCameraMuteChanged = true;
     }
     return OK;
@@ -5854,8 +5867,8 @@ bool Camera3Device::RequestThread::overrideTestPattern(
         request->mOriginalTestPatternData[3]
     };
 
-    if (mCameraMute) {
-        testPatternMode = ANDROID_SENSOR_TEST_PATTERN_MODE_SOLID_COLOR;
+    if (mCameraMute != ANDROID_SENSOR_TEST_PATTERN_MODE_OFF) {
+        testPatternMode = mCameraMute;
         testPatternData[0] = 0;
         testPatternData[1] = 0;
         testPatternData[2] = 0;
@@ -6545,7 +6558,11 @@ status_t Camera3Device::setCameraMute(bool enabled) {
     if (mRequestThread == nullptr || !mSupportCameraMute) {
         return INVALID_OPERATION;
     }
-    return mRequestThread->setCameraMute(enabled);
+    int32_t muteMode =
+            !enabled                      ? ANDROID_SENSOR_TEST_PATTERN_MODE_OFF :
+            mSupportTestPatternSolidColor ? ANDROID_SENSOR_TEST_PATTERN_MODE_SOLID_COLOR :
+                                            ANDROID_SENSOR_TEST_PATTERN_MODE_BLACK;
+    return mRequestThread->setCameraMute(muteMode);
 }
 
 status_t Camera3Device::injectCamera(const String8& injectedCamId,

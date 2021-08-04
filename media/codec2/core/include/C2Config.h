@@ -262,6 +262,8 @@ enum C2ParamIndexKind : C2Param::type_index_t {
     kParamIndexTunneledMode, // struct
     kParamIndexTunnelHandle, // int32[]
     kParamIndexTunnelSystemTime, // int64
+    kParamIndexTunnelHoldRender, // bool
+    kParamIndexTunnelStartRender, // bool
 
     // dmabuf allocator
     kParamIndexStoreDmaBufUsage,  // store, struct
@@ -572,7 +574,6 @@ enum C2Config::profile_t : uint32_t {
     PROFILE_MPEGH_HIGH,                         ///< MPEG-H High
     PROFILE_MPEGH_LC,                           ///< MPEG-H Low-complexity
     PROFILE_MPEGH_BASELINE,                     ///< MPEG-H Baseline
-
 };
 
 enum C2Config::level_t : uint32_t {
@@ -2366,22 +2367,49 @@ typedef C2PortParam<C2Info, C2SimpleValueStruct<int64_t>, kParamIndexTunnelSyste
         C2PortTunnelSystemTime;
 constexpr char C2_PARAMKEY_OUTPUT_RENDER_TIME[] = "output.render-time";
 
-C2ENUM(C2PlatformConfig::encoding_quality_level_t, uint32_t,
-    NONE,
-    S_HANDHELD,
-    S_HANDHELD_PC
-);
 
-namespace android {
+/**
+ * Tunneled mode video peek signaling flag.
+ *
+ * When a video frame is pushed to the decoder with this parameter set to true,
+ * the decoder must decode the frame, signal partial completion, and hold on the
+ * frame until C2StreamTunnelStartRender is set to true (which resets this
+ * flag). Flush will also result in the frames being returned back to the
+ * client (but not rendered).
+ */
+typedef C2StreamParam<C2Info, C2EasyBoolValue, kParamIndexTunnelHoldRender>
+        C2StreamTunnelHoldRender;
+constexpr char C2_PARAMKEY_TUNNEL_HOLD_RENDER[] = "output.tunnel-hold-render";
+
+/**
+ * Tunneled mode video peek signaling flag.
+ *
+ * Upon receiving this flag, the decoder shall set C2StreamTunnelHoldRender to
+ * false, which shall cause any frames held for rendering to be immediately
+ * displayed, regardless of their timestamps.
+*/
+typedef C2StreamParam<C2Info, C2EasyBoolValue, kParamIndexTunnelStartRender>
+        C2StreamTunnelStartRender;
+constexpr char C2_PARAMKEY_TUNNEL_START_RENDER[] = "output.tunnel-start-render";
 
 /**
  * Encoding quality level signaling.
+ *
+ * Signal the 'minimum encoding quality' introduced in Android 12/S. It indicates
+ * whether the underlying codec is expected to take extra steps to ensure quality meets the
+ * appropriate minimum. A value of NONE indicates that the codec is not to apply
+ * any minimum quality bar requirements. Other values indicate that the codec is to apply
+ * a minimum quality bar, with the exact quality bar being decided by the parameter value.
  */
 typedef C2GlobalParam<C2Setting,
         C2SimpleValueStruct<C2EasyEnum<C2PlatformConfig::encoding_quality_level_t>>,
         kParamIndexEncodingQualityLevel> C2EncodingQualityLevel;
+constexpr char C2_PARAMKEY_ENCODING_QUALITY_LEVEL[] = "algo.encoding-quality-level";
 
-}
+C2ENUM(C2PlatformConfig::encoding_quality_level_t, uint32_t,
+    NONE = 0,
+    S_HANDHELD = 1              // corresponds to VMAF=70
+);
 
 /// @}
 

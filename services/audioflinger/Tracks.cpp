@@ -650,7 +650,6 @@ AudioFlinger::PlaybackThread::Track::Track(
     mMainBuffer(thread->sinkBuffer()),
     mAuxBuffer(NULL),
     mAuxEffectId(0), mHasVolumeController(false),
-    mPresentationCompleteFrames(0),
     mFrameMap(16 /* sink-frame-to-track-frame map memory */),
     mVolumeHandler(new media::VolumeHandler(sampleRate)),
     mOpPlayAudioMonitor(OpPlayAudioMonitor::createIfNeeded(attributionSource, attr, id(),
@@ -1459,6 +1458,7 @@ void AudioFlinger::PlaybackThread::Track::setAuxBuffer(int EffectId, int32_t *bu
     mAuxBuffer = buffer;
 }
 
+// presentationComplete verified by frames, used by Mixed tracks.
 bool AudioFlinger::PlaybackThread::Track::presentationComplete(
         int64_t framesWritten, size_t audioHalFrames)
 {
@@ -1477,28 +1477,68 @@ bool AudioFlinger::PlaybackThread::Track::presentationComplete(
             (long long)mPresentationCompleteFrames, (long long)framesWritten);
     if (mPresentationCompleteFrames == 0) {
         mPresentationCompleteFrames = framesWritten + audioHalFrames;
-        ALOGV("%s(%d): presentationComplete() reset:"
+        ALOGV("%s(%d): set:"
                 " mPresentationCompleteFrames %lld audioHalFrames %zu",
                 __func__, mId,
                 (long long)mPresentationCompleteFrames, audioHalFrames);
     }
 
     bool complete;
-    if (isOffloaded()) {
-        complete = true;
-    } else if (isDirect() || isFastTrack()) { // these do not go through linear map
+    if (isFastTrack()) { // does not go through linear map
         complete = framesWritten >= (int64_t) mPresentationCompleteFrames;
+        ALOGV("%s(%d): %s framesWritten:%lld  mPresentationCompleteFrames:%lld",
+                __func__, mId, (complete ? "complete" : "waiting"),
+                (long long) framesWritten, (long long) mPresentationCompleteFrames);
     } else {  // Normal tracks, OutputTracks, and PatchTracks
         complete = framesWritten >= (int64_t) mPresentationCompleteFrames
                 && mAudioTrackServerProxy->isDrained();
     }
 
     if (complete) {
-        triggerEvents(AudioSystem::SYNC_EVENT_PRESENTATION_COMPLETE);
-        mAudioTrackServerProxy->setStreamEndDone();
+        notifyPresentationComplete();
         return true;
     }
     return false;
+}
+
+// presentationComplete checked by time, used by DirectTracks.
+bool AudioFlinger::PlaybackThread::Track::presentationComplete(uint32_t latencyMs)
+{
+    // For Offloaded or Direct tracks.
+
+    // For a direct track, we incorporated time based testing for presentationComplete.
+
+    // For an offloaded track the HAL+h/w delay is variable so a HAL drain() is used
+    // to detect when all frames have been played. In this case latencyMs isn't
+    // useful because it doesn't always reflect whether there is data in the h/w
+    // buffers, particularly if a track has been paused and resumed during draining
+
+    constexpr float MIN_SPEED = 0.125f; // min speed scaling allowed for timely response.
+    if (mPresentationCompleteTimeNs == 0) {
+        mPresentationCompleteTimeNs = systemTime() + latencyMs * 1e6 / fmax(mSpeed, MIN_SPEED);
+        ALOGV("%s(%d): set: latencyMs %u  mPresentationCompleteTimeNs:%lld",
+                __func__, mId, latencyMs, (long long) mPresentationCompleteTimeNs);
+    }
+
+    bool complete;
+    if (isOffloaded()) {
+        complete = true;
+    } else { // Direct
+        complete = systemTime() >= mPresentationCompleteTimeNs;
+        ALOGV("%s(%d): %s", __func__, mId, (complete ? "complete" : "waiting"));
+    }
+    if (complete) {
+        notifyPresentationComplete();
+        return true;
+    }
+    return false;
+}
+
+void AudioFlinger::PlaybackThread::Track::notifyPresentationComplete()
+{
+    // This only triggers once. TODO: should we enforce this?
+    triggerEvents(AudioSystem::SYNC_EVENT_PRESENTATION_COMPLETE);
+    mAudioTrackServerProxy->setStreamEndDone();
 }
 
 void AudioFlinger::PlaybackThread::Track::triggerEvents(AudioSystem::sync_event_t type)
@@ -2204,109 +2244,6 @@ void AudioFlinger::PlaybackThread::PatchTrack::restartIfDisabled()
 // ----------------------------------------------------------------------------
 
 
-// ----------------------------------------------------------------------------
-//      AppOp for audio recording
-// -------------------------------
-
-#undef LOG_TAG
-#define LOG_TAG "AF::OpRecordAudioMonitor"
-
-// static
-sp<AudioFlinger::RecordThread::OpRecordAudioMonitor>
-AudioFlinger::RecordThread::OpRecordAudioMonitor::createIfNeeded(
-            const AttributionSourceState& attributionSource, const audio_attributes_t& attr)
-{
-    if (isServiceUid(attributionSource.uid)) {
-        ALOGV("not silencing record for service %s",
-                attributionSource.toString().c_str());
-        return nullptr;
-    }
-
-    // Capturing from FM TUNER output is not controlled by an app op
-    // because it does not affect users privacy as does capturing from an actual microphone.
-    if (attr.source == AUDIO_SOURCE_FM_TUNER) {
-        ALOGV("not muting FM TUNER capture for uid %d", attributionSource.uid);
-        return nullptr;
-    }
-
-    AttributionSourceState checkedAttributionSource = AudioFlinger::checkAttributionSourcePackage(
-            attributionSource);
-    if (!checkedAttributionSource.packageName.has_value()
-            || checkedAttributionSource.packageName.value().size() == 0) {
-        return nullptr;
-    }
-    return new OpRecordAudioMonitor(checkedAttributionSource, getOpForSource(attr.source));
-}
-
-AudioFlinger::RecordThread::OpRecordAudioMonitor::OpRecordAudioMonitor(
-        const AttributionSourceState& attributionSource, int32_t appOp)
-        : mHasOp(true), mAttributionSource(attributionSource), mAppOp(appOp)
-{
-}
-
-AudioFlinger::RecordThread::OpRecordAudioMonitor::~OpRecordAudioMonitor()
-{
-    if (mOpCallback != 0) {
-        mAppOpsManager.stopWatchingMode(mOpCallback);
-    }
-    mOpCallback.clear();
-}
-
-void AudioFlinger::RecordThread::OpRecordAudioMonitor::onFirstRef()
-{
-    checkOp();
-    mOpCallback = new RecordAudioOpCallback(this);
-    ALOGV("start watching op %d for %s", mAppOp, mAttributionSource.toString().c_str());
-    // TODO: We need to always watch AppOpsManager::OP_RECORD_AUDIO too
-    // since it controls the mic permission for legacy apps.
-    mAppOpsManager.startWatchingMode(mAppOp, VALUE_OR_FATAL(aidl2legacy_string_view_String16(
-        mAttributionSource.packageName.value_or(""))),
-        mOpCallback);
-}
-
-bool AudioFlinger::RecordThread::OpRecordAudioMonitor::hasOp() const {
-    return mHasOp.load();
-}
-
-// Called by RecordAudioOpCallback when the app op corresponding to this OpRecordAudioMonitor
-// is updated in AppOp callback and in onFirstRef()
-// Note this method is never called (and never to be) for audio server / root track
-// due to the UID in createIfNeeded(). As a result for those record track, it's:
-// - not called from constructor,
-// - not called from RecordAudioOpCallback because the callback is not installed in this case
-void AudioFlinger::RecordThread::OpRecordAudioMonitor::checkOp()
-{
-    // TODO: We need to always check AppOpsManager::OP_RECORD_AUDIO too
-    // since it controls the mic permission for legacy apps.
-    const int32_t mode = mAppOpsManager.checkOp(mAppOp,
-            mAttributionSource.uid, VALUE_OR_FATAL(aidl2legacy_string_view_String16(
-                mAttributionSource.packageName.value_or(""))));
-    const bool hasIt = (mode == AppOpsManager::MODE_ALLOWED);
-    // verbose logging only log when appOp changed
-    ALOGI_IF(hasIt != mHasOp.load(),
-            "App op %d missing, %ssilencing record %s",
-            mAppOp, hasIt ? "un" : "", mAttributionSource.toString().c_str());
-    mHasOp.store(hasIt);
-}
-
-AudioFlinger::RecordThread::OpRecordAudioMonitor::RecordAudioOpCallback::RecordAudioOpCallback(
-        const wp<OpRecordAudioMonitor>& monitor) : mMonitor(monitor)
-{ }
-
-void AudioFlinger::RecordThread::OpRecordAudioMonitor::RecordAudioOpCallback::opChanged(int32_t op,
-            const String16& packageName) {
-    UNUSED(packageName);
-    sp<OpRecordAudioMonitor> monitor = mMonitor.promote();
-    if (monitor != NULL) {
-        if (op != monitor->getOp()) {
-            return;
-        }
-        monitor->checkOp();
-    }
-}
-
-
-
 #undef LOG_TAG
 #define LOG_TAG "AF::RecordHandle"
 
@@ -2407,7 +2344,6 @@ AudioFlinger::RecordThread::RecordTrack::RecordTrack(
         mRecordBufferConverter(NULL),
         mFlags(flags),
         mSilenced(false),
-        mOpRecordAudioMonitor(OpRecordAudioMonitor::createIfNeeded(attributionSource, attr)),
         mStartFrames(startFrames)
 {
     if (mCblk == NULL) {
@@ -2664,14 +2600,6 @@ void AudioFlinger::RecordThread::RecordTrack::updateTrackFrameInfo(
 
     mServerLatencyFromTrack.store(useTrackTimestamp);
     mServerLatencyMs.store(latencyMs);
-}
-
-bool AudioFlinger::RecordThread::RecordTrack::isSilenced() const {
-    if (mSilenced) {
-        return true;
-    }
-    // The monitor is only created for record tracks that can be silenced.
-    return mOpRecordAudioMonitor ? !mOpRecordAudioMonitor->hasOp() : false;
 }
 
 status_t AudioFlinger::RecordThread::RecordTrack::getActiveMicrophones(

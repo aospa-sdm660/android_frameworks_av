@@ -730,7 +730,10 @@ void AudioPolicyService::updateUidStates_l()
                     && !(isTopOrLatestSensitive || current->canCaptureOutput))
                 && canCaptureIfInCallOrCommunication(current);
 
-        if (isVirtualSource(source)) {
+        if (!current->hasOp()) {
+            // Never allow capture if app op is denied
+            allowCapture = false;
+        } else if (isVirtualSource(source)) {
             // Allow capture for virtual (remote submix, call audio TX or RX...) sources
             allowCapture = true;
         } else if (mUidPolicy->isAssistantUid(currentUid)) {
@@ -786,7 +789,7 @@ void AudioPolicyService::updateUidStates_l()
                 allowCapture = true;
             }
         }
-        setAppState_l(current->portId,
+        setAppState_l(current,
                       allowCapture ? apmStatFromAmState(mUidPolicy->getUidState(currentUid)) :
                                 APP_STATE_IDLE);
     }
@@ -796,7 +799,7 @@ void AudioPolicyService::silenceAllRecordings_l() {
     for (size_t i = 0; i < mAudioRecordClients.size(); i++) {
         sp<AudioRecordClient> current = mAudioRecordClients[i];
         if (!isVirtualSource(current->attributes.source)) {
-            setAppState_l(current->portId, APP_STATE_IDLE);
+            setAppState_l(current, APP_STATE_IDLE);
         }
     }
 }
@@ -830,17 +833,45 @@ bool AudioPolicyService::isVirtualSource(audio_source_t source)
     return false;
 }
 
-void AudioPolicyService::setAppState_l(audio_port_handle_t portId, app_state_t state)
+/* static */
+bool AudioPolicyService::isAppOpSource(audio_source_t source)
+{
+    switch (source) {
+        case AUDIO_SOURCE_FM_TUNER:
+        case AUDIO_SOURCE_ECHO_REFERENCE:
+            return false;
+        default:
+            break;
+    }
+    return true;
+}
+
+void AudioPolicyService::setAppState_l(sp<AudioRecordClient> client, app_state_t state)
 {
     AutoCallerClear acc;
 
     if (mAudioPolicyManager) {
-        mAudioPolicyManager->setAppState(portId, state);
+        mAudioPolicyManager->setAppState(client->portId, state);
     }
     sp<IAudioFlinger> af = AudioSystem::get_audio_flinger();
     if (af) {
         bool silenced = state == APP_STATE_IDLE;
-        af->setRecordSilenced(portId, silenced);
+        if (client->silenced != silenced) {
+            if (client->active) {
+                if (silenced) {
+                    finishRecording(client->attributionSource, client->attributes.source);
+                } else {
+                    std::stringstream msg;
+                    msg << "Audio recording un-silenced on session " << client->session;
+                    if (!startRecording(client->attributionSource, String16(msg.str().c_str()),
+                            client->attributes.source)) {
+                        silenced = true;
+                    }
+                }
+            }
+            af->setRecordSilenced(client->portId, silenced);
+            client->silenced = silenced;
+        }
     }
 }
 
@@ -1403,6 +1434,109 @@ binder::Status AudioPolicyService::SensorPrivacyPolicy::onSensorPrivacyChanged(b
     return binder::Status::ok();
 }
 
+// -----------  AudioPolicyService::OpRecordAudioMonitor implementation ----------
+
+// static
+sp<AudioPolicyService::OpRecordAudioMonitor>
+AudioPolicyService::OpRecordAudioMonitor::createIfNeeded(
+            const AttributionSourceState& attributionSource, const audio_attributes_t& attr,
+            wp<AudioCommandThread> commandThread)
+{
+    if (isAudioServerOrRootUid(attributionSource.uid)) {
+        ALOGV("not silencing record for audio or root source %s",
+                attributionSource.toString().c_str());
+        return nullptr;
+    }
+
+    if (!AudioPolicyService::isAppOpSource(attr.source)) {
+        ALOGD("not monitoring app op for uid %d and source %d",
+                attributionSource.uid, attr.source);
+        return nullptr;
+    }
+
+    if (!attributionSource.packageName.has_value()
+            || attributionSource.packageName.value().size() == 0) {
+        return nullptr;
+    }
+    return new OpRecordAudioMonitor(attributionSource, getOpForSource(attr.source), commandThread);
+}
+
+AudioPolicyService::OpRecordAudioMonitor::OpRecordAudioMonitor(
+        const AttributionSourceState& attributionSource, int32_t appOp,
+        wp<AudioCommandThread> commandThread) :
+            mHasOp(true), mAttributionSource(attributionSource), mAppOp(appOp),
+            mCommandThread(commandThread)
+{
+}
+
+AudioPolicyService::OpRecordAudioMonitor::~OpRecordAudioMonitor()
+{
+    if (mOpCallback != 0) {
+        mAppOpsManager.stopWatchingMode(mOpCallback);
+    }
+    mOpCallback.clear();
+}
+
+void AudioPolicyService::OpRecordAudioMonitor::onFirstRef()
+{
+    checkOp();
+    mOpCallback = new RecordAudioOpCallback(this);
+    ALOGV("start watching op %d for %s", mAppOp, mAttributionSource.toString().c_str());
+    // TODO: We need to always watch AppOpsManager::OP_RECORD_AUDIO too
+    // since it controls the mic permission for legacy apps.
+    mAppOpsManager.startWatchingMode(mAppOp, VALUE_OR_FATAL(aidl2legacy_string_view_String16(
+        mAttributionSource.packageName.value_or(""))),
+        mOpCallback);
+}
+
+bool AudioPolicyService::OpRecordAudioMonitor::hasOp() const {
+    return mHasOp.load();
+}
+
+// Called by RecordAudioOpCallback when the app op corresponding to this OpRecordAudioMonitor
+// is updated in AppOp callback and in onFirstRef()
+// Note this method is never called (and never to be) for audio server / root track
+// due to the UID in createIfNeeded(). As a result for those record track, it's:
+// - not called from constructor,
+// - not called from RecordAudioOpCallback because the callback is not installed in this case
+void AudioPolicyService::OpRecordAudioMonitor::checkOp(bool updateUidStates)
+{
+    // TODO: We need to always check AppOpsManager::OP_RECORD_AUDIO too
+    // since it controls the mic permission for legacy apps.
+    const int32_t mode = mAppOpsManager.checkOp(mAppOp,
+            mAttributionSource.uid, VALUE_OR_FATAL(aidl2legacy_string_view_String16(
+                mAttributionSource.packageName.value_or(""))));
+    const bool hasIt = (mode == AppOpsManager::MODE_ALLOWED);
+    // verbose logging only log when appOp changed
+    ALOGI_IF(hasIt != mHasOp.load(),
+            "App op %d missing, %ssilencing record %s",
+            mAppOp, hasIt ? "un" : "", mAttributionSource.toString().c_str());
+    mHasOp.store(hasIt);
+
+    if (updateUidStates) {
+          sp<AudioCommandThread> commandThread = mCommandThread.promote();
+          if (commandThread != nullptr) {
+              commandThread->updateUidStatesCommand();
+          }
+    }
+}
+
+AudioPolicyService::OpRecordAudioMonitor::RecordAudioOpCallback::RecordAudioOpCallback(
+        const wp<OpRecordAudioMonitor>& monitor) : mMonitor(monitor)
+{ }
+
+void AudioPolicyService::OpRecordAudioMonitor::RecordAudioOpCallback::opChanged(int32_t op,
+            const String16& packageName __unused) {
+    sp<OpRecordAudioMonitor> monitor = mMonitor.promote();
+    if (monitor != NULL) {
+        if (op != monitor->getOp()) {
+            return;
+        }
+        monitor->checkOp(true);
+    }
+}
+
+
 // -----------  AudioPolicyService::AudioCommandThread implementation ----------
 
 AudioPolicyService::AudioCommandThread::AudioCommandThread(String8 name,
@@ -1632,6 +1766,17 @@ bool AudioPolicyService::AudioCommandThread::threadLoop()
                     mLock.lock();
                     } break;
 
+                case UPDATE_UID_STATES: {
+                    ALOGV("AudioCommandThread() processing updateUID states");
+                    svc = mService.promote();
+                    if (svc == 0) {
+                        break;
+                    }
+                    mLock.unlock();
+                    svc->updateUidStates();
+                    mLock.lock();
+                    } break;
+
                 default:
                     ALOGW("AudioCommandThread() unknown command %d", command->mCommand);
                 }
@@ -1854,6 +1999,14 @@ void AudioPolicyService::AudioCommandThread::updateAudioPortListCommand()
     sp<AudioCommand> command = new AudioCommand();
     command->mCommand = UPDATE_AUDIOPORT_LIST;
     ALOGV("AudioCommandThread() adding update audio port list");
+    sendCommand(command);
+}
+
+void AudioPolicyService::AudioCommandThread::updateUidStatesCommand()
+{
+    sp<AudioCommand> command = new AudioCommand();
+    command->mCommand = UPDATE_UID_STATES;
+    ALOGV("AudioCommandThread() adding update UID states");
     sendCommand(command);
 }
 
